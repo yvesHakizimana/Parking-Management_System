@@ -1,8 +1,11 @@
-import redis
 import time
 from datetime import datetime
 import math
+
+import redis
+
 from connection.arduino_manager import ArduinoManager
+from database.db_manager import DatabaseManager
 
 # Redis configuration
 REDIS_HOST = 'localhost'
@@ -18,7 +21,8 @@ MAX_BALANCE = 999999999  # Maximum balance (safety check)
 
 class PaymentProcessor:
     def __init__(self):
-        self.redis_client = None
+        self.db_manager = DatabaseManager()  # Use db_manager instead of direct Redis
+        self.redis_client = self.db_manager.redis_client  # For backward compatibility
         self.arduino_manager = None
         self.connected = False
 
@@ -97,93 +101,51 @@ class PaymentProcessor:
             return None
 
     def get_unpaid_entry(self, plate_number):
-        """Get the unpaid entry for a plate number"""
+        """Get unpaid entry for a plate number"""
+        entry_ids = self.db_manager.get_entries_for_plate(plate_number)
+        for entry_id in entry_ids:
+            entry_data = self.db_manager.get_entry(int(entry_id))
+            if entry_data and entry_data.get('payment_status') == '0':
+                return entry_id, entry_data
+        return None, None
+
+    def process_transaction(self, plate_number, balance_str):
+        """Process payment transaction for a plate number"""
         try:
-            entry_ids = self.redis_client.smembers(f"entries:{plate_number}")
-            if not entry_ids:
-                return None, None
-
-            # Look for unpaid entries (payment_status = "0")
-            for entry_id in entry_ids:
-                entry_data = self.redis_client.hgetall(f"entry:{entry_id}")
-                if entry_data and entry_data.get("payment_status") == "0":
-                    return entry_id, entry_data
-
-            return None, None
-        except Exception as e:
-            print(f"[ERROR] Database lookup failed: {e}")
-            return None, None
-
-    def process_transaction(self, plate, balance_str):
-        """Process the parking payment transaction"""
-        try:
-            # Input validation
-            if not plate or not plate.strip():
-                return False, "Invalid plate number"
-
-            plate = plate.strip().upper()
-
             # Validate balance
-            is_valid, balance_int, error_msg = self.validate_balance(balance_str)
+            is_valid, balance, error_msg = self.validate_balance(balance_str)
             if not is_valid:
-                return False, error_msg
+                return False, f"Invalid balance: {error_msg}"
 
-            # Find unpaid entry
-            entry_id, entry_data = self.get_unpaid_entry(plate)
-            if not entry_id:
-                return False, "No unpaid entry found for this vehicle"
-
-            # Verify entry is not already paid
-            if entry_data.get("payment_status") != "0":
-                return False, "Entry already paid"
+            # Get unpaid entry for this plate
+            entry_id, entry_data = self.get_unpaid_entry(plate_number)
+            if not entry_id or not entry_data:
+                return False, "No unpaid parking session found"
 
             # Calculate charge
-            charge = self.calculate_charge(entry_data.get("entry_timestamp", ""))
+            charge = self.calculate_charge(entry_data['entry_timestamp'])
             if charge is None:
-                return False, "Invalid entry timestamp - cannot calculate charge"
+                return False, "Failed to calculate parking charge"
 
-            # Check sufficient balance
-            if balance_int < charge:
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                self.redis_client.rpush("logs",
-                                        f"{timestamp} - PAYMENT FAILED - {plate} - Insufficient balance: {balance_int} < {charge}")
-                return False, f"Insufficient balance. Need: {charge} RWF, Available: {balance_int} RWF"
+            # Check if balance is sufficient
+            if balance < charge:
+                return False, f"Insufficient balance. Required: {charge} RWF, Available: {balance} RWF"
 
             # Calculate new balance
-            new_balance = balance_int - charge
+            new_balance = balance - charge
 
-            # Verify new balance is not negative (safety check)
-            if new_balance < MIN_BALANCE:
-                return False, f"Transaction would result in invalid balance: {new_balance}"
-
-            # Process payment atomically
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            # Update entry with payment information
-            payment_data = {
-                "payment_status": "1",
-                "payment_timestamp": timestamp,
-                "charge_amount": str(charge)
-            }
-
-            # Use Redis pipeline for atomic operations
-            pipe = self.redis_client.pipeline()
-            pipe.hset(f"entry:{entry_id}", mapping=payment_data)
-            pipe.rpush("logs",
-                       f"{timestamp} - PAYMENT SUCCESS - {plate} - Charged: {charge} RWF - New Balance: {new_balance} RWF - Entry ID: {entry_id}")
-            pipe.execute()
-
-            print(f"[SUCCESS] {plate} - Charged: {charge} RWF - New Balance: {new_balance} RWF")
-            return True, str(new_balance)
+            # Update payment status in database
+            if self.db_manager.update_payment_status(int(entry_id), charge):
+                self.db_manager.log_message(
+                    f"Payment processed for {plate_number} - Amount: {charge} RWF, New balance: {new_balance} RWF",
+                    "PAYMENT"
+                )
+                return True, str(new_balance)
+            else:
+                return False, "Database update failed"
 
         except Exception as e:
-            error_msg = f"Transaction processing error: {str(e)}"
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            try:
-                self.redis_client.rpush("logs", f"{timestamp} - PAYMENT ERROR - {plate} - {error_msg}")
-            except:
-                pass
-            return False, error_msg
+            return False, f"Transaction processing error: {str(e)}"
 
     def handle_payment_request(self, message):
         """Handle payment request from Arduino"""

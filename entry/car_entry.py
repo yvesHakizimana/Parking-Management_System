@@ -3,19 +3,20 @@ import time
 import pytesseract
 import cv2
 from ultralytics import YOLO
-import redis
 import re
 import threading
 import sys
 from collections import deque, Counter
 from datetime import datetime
 from connection.arduino_manager import ArduinoManager
+from database.db_manager import DatabaseManager  # Add this import
 
 # Point pytesseract at the system binary on linux
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# Initialize Redis Connection
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Initialize Database Manager (replaces direct Redis)
+db_manager = DatabaseManager()
+redis_client = db_manager.redis_client  # For backward compatibility
 
 MODEL_PATH = os.path.expanduser("../models/best.pt")
 model = YOLO(MODEL_PATH)
@@ -55,16 +56,17 @@ def is_car_inside(plate_number):
     Check if a car is currently inside the parking lot.
     Returns True if there's any unpaid and non-exited entry.
     """
-    entry_ids = redis_client.smembers(f"entries:{plate_number}")
+    entry_ids = db_manager.get_entries_for_plate(plate_number)  # Use db_manager
     if not entry_ids:
         return False
 
     for entry_id in entry_ids:
-        entry_data = redis_client.hgetall(f"entry:{entry_id}")
-        # Car is inside if payment is pending OR paid but not exited
-        if (entry_data.get("payment_status") == "0" or
-                (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
-            return True
+        entry_data = db_manager.get_entry(int(entry_id))  # Use db_manager
+        if entry_data:
+            # Car is inside if payment is pending OR paid but not exited
+            if (entry_data.get("payment_status") == "0" or
+                    (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
+                return True
     return False
 
 def get_active_entry_id(plate_number):
@@ -72,15 +74,16 @@ def get_active_entry_id(plate_number):
     Get the active entry ID for a plate (unpaid or paid but not exited).
     Returns entry_id if found, None otherwise.
     """
-    entry_ids = redis_client.smembers(f"entries:{plate_number}")
+    entry_ids = db_manager.get_entries_for_plate(plate_number)  # Use db_manager
     if not entry_ids:
         return None
 
     for entry_id in entry_ids:
-        entry_data = redis_client.hgetall(f"entry:{entry_id}")
-        if (entry_data.get("payment_status") == "0" or
-                (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
-            return entry_id
+        entry_data = db_manager.get_entry(int(entry_id))  # Use db_manager
+        if entry_data:
+            if (entry_data.get("payment_status") == "0" or
+                    (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
+                return entry_id
     return None
 
 # Initialize webcam
@@ -148,8 +151,10 @@ try:
                             if is_car_inside(most_common):
                                 print(f"[ACCESS DENIED] {most_common} is already inside")
                                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                redis_client.rpush("logs",
-                                                   f"{timestamp} - ENTRY DENIED - {most_common} - Already inside")
+                                db_manager.log_message(  # Use db_manager
+                                    f"{timestamp} - ENTRY DENIED - {most_common} - Already inside",
+                                    "SECURITY"
+                                )
                                 continue
 
                             if (most_common == last_saved_plate and
@@ -172,16 +177,20 @@ try:
                                 "payment_timestamp": ""
                             }
 
-                            redis_client.hset(f"entry:{entry_id}", mapping=entry_data)
-                            redis_client.sadd(f"entries:{most_common}", entry_id)
-                            redis_client.rpush("logs",
-                                               f"{timestamp} - ENTRY GRANTED - {most_common} - Entry ID: {entry_id}")
-                            print(f"[ENTRY GRANTED] {most_common} logged with ID: {entry_id}")
+                            # Use db_manager to write entry (goes to both Redis and MySQL)
+                            if db_manager.write_entry(entry_id, entry_data):
+                                db_manager.log_message(  # Use db_manager
+                                    f"{timestamp} - ENTRY GRANTED - {most_common} - Entry ID: {entry_id}",
+                                    "ENTRY"
+                                )
+                                print(f"[ENTRY GRANTED] {most_common} logged with ID: {entry_id}")
 
-                            threading.Thread(target=open_gate).start()
+                                threading.Thread(target=open_gate).start()
 
-                            last_saved_plate = most_common
-                            last_entry_time = now
+                                last_saved_plate = most_common
+                                last_entry_time = now
+                            else:
+                                print(f"[ERROR] Failed to save entry for {most_common}")
 
                     cv2.imshow("Plate", plate_img)
                     cv2.imshow("Processed", thresh)

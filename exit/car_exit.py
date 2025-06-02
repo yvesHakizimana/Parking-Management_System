@@ -4,18 +4,19 @@ import time
 import pytesseract
 import cv2
 from ultralytics import YOLO
-import redis
 import re
 import threading
 from collections import deque, Counter
 from datetime import datetime
 from connection.arduino_manager import ArduinoManager
+from database.db_manager import DatabaseManager  # Add this import
 
 # Point pytesseract at the system binary on linux
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# Initialize Redis connection
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Initialize Database Manager (replaces direct Redis)
+db_manager = DatabaseManager()
+redis_client = db_manager.redis_client  # For backward compatibility
 
 # Load YOLO model
 MODEL_PATH = os.path.expanduser("../models/best.pt")
@@ -78,13 +79,13 @@ def has_valid_entry_for_exit(plate_number):
     Returns (has_entry, entry_id, message)
     """
     try:
-        entry_ids = redis_client.smembers(f"entries:{plate_number}")
+        entry_ids = db_manager.get_entries_for_plate(plate_number)  # Use db_manager
         if not entry_ids:
             return False, None, "No entry record found"
 
         # Find the most recent entry
         latest_entry_id = max(entry_ids, key=int)
-        entry_data = redis_client.hgetall(f"entry:{latest_entry_id}")
+        entry_data = db_manager.get_entry(int(latest_entry_id))  # Use db_manager
 
         if not entry_data:
             return False, None, "Invalid entry data"
@@ -113,9 +114,17 @@ def mark_as_exited(entry_id):
     """
     try:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        redis_client.hset(f"entry:{entry_id}", "exit_status", "1")
-        redis_client.hset(f"entry:{entry_id}", "exit_timestamp", timestamp)
-        return True
+
+        # Get current entry data
+        entry_data = db_manager.get_entry(int(entry_id))
+        if entry_data:
+            # Update exit status and timestamp
+            entry_data["exit_status"] = "1"
+            entry_data["exit_timestamp"] = timestamp
+
+            # Write updated entry back to both Redis and MySQL
+            return db_manager.write_entry(int(entry_id), entry_data)
+        return False
     except Exception as e:
         print(f"[ERROR] Failed to mark as exited: {e}")
         return False
@@ -126,18 +135,19 @@ def is_car_inside(plate_number):
     Check if a car is currently inside (has unpaid entry or paid but not exited).
     """
     try:
-        entry_ids = redis_client.smembers(f"entries:{plate_number}")
+        entry_ids = db_manager.get_entries_for_plate(plate_number)  # Use db_manager
         if not entry_ids:
             return False
 
         for entry_id in entry_ids:
-            entry_data = redis_client.hgetall(f"entry:{entry_id}")
-            payment_status = entry_data.get("payment_status", "0")
-            exit_status = entry_data.get("exit_status", "0")
+            entry_data = db_manager.get_entry(int(entry_id))  # Use db_manager
+            if entry_data:
+                payment_status = entry_data.get("payment_status", "0")
+                exit_status = entry_data.get("exit_status", "0")
 
-            # Car is inside if: unpaid OR (paid but not exited)
-            if payment_status == "0" or (payment_status == "1" and exit_status != "1"):
-                return True
+                # Car is inside if: unpaid OR (paid but not exited)
+                if payment_status == "0" or (payment_status == "1" and exit_status != "1"):
+                    return True
 
         return False
     except Exception as e:
@@ -150,19 +160,19 @@ def log_unauthorized_attempt(plate_number, reason):
     try:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         alert_msg = f"{timestamp} - UNAUTHORIZED EXIT ATTEMPT - {plate_number} - {reason} - ALERT TRIGGERED"
-        redis_client.rpush("security_alerts", alert_msg)
-        redis_client.rpush("logs", alert_msg)
+
+        # Use db_manager for both security alerts and regular logs
+        db_manager.log_security_alert(alert_msg, plate_number, "HIGH")
+        db_manager.log_message(alert_msg, "SECURITY")
+
         print(f"[SECURITY ALERT] {alert_msg}")
     except Exception as e:
         print(f"[ERROR] Failed to log unauthorized attempt: {e}")
 
 
 def log_to_redis(message):
-    """Safely log messages to Redis with error handling"""
-    try:
-        redis_client.rpush("logs", message)
-    except Exception as e:
-        print(f"[ERROR] Failed to log to Redis: {e}")
+    """Safely log messages using db_manager"""
+    db_manager.log_message(message, "EXIT")
 
 
 # Initialize webcam with error handling
