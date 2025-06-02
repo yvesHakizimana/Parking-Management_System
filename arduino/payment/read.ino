@@ -4,7 +4,7 @@
 #define RST_PIN 9
 #define SS_PIN 10
 #define LED_PIN 2
-#define BALANCE_BLOCK 4
+#define BALANCE_BLOCK 6  // Changed from 5 to avoid trailer block conflicts
 #define PLATE_BLOCK 5
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);

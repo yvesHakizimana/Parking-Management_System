@@ -4,7 +4,7 @@
 
 #define RST_PIN 9
 #define SS_PIN 10
-#define BALANCE_BLOCK 4
+#define BALANCE_BLOCK 6  // Changed from 5 to avoid trailer block conflicts
 #define PLATE_BLOCK 5
 
 
@@ -72,21 +72,21 @@ void loop() {
 String readBlock(byte block) {
   byte buffer[18];
   byte size = sizeof(buffer);
-  
+
   card_status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
   if (card_status != MFRC522::STATUS_OK) {
     Serial.print(F("❌ Auth failed: "));
     Serial.println(mfrc522.GetStatusCodeName(card_status));
     return "";
   }
-  
+
   card_status = mfrc522.MIFARE_Read(block, buffer, &size);
   if (card_status != MFRC522::STATUS_OK) {
     Serial.print(F("❌ Read failed: "));
     Serial.println(mfrc522.GetStatusCodeName(card_status));
     return "";
   }
-  
+
   String value = "";
   for (uint8_t i = 0; i < 16; i++) {
     if (buffer[i] == 0 || buffer[i] == ' ') break;
@@ -101,21 +101,21 @@ bool writeBlock(byte block, String data) {
   if (data.length() > 16) data = data.substring(0, 16);
   data.toCharArray((char *)buffer, 16);
   for (byte i = data.length(); i < 16; i++) buffer[i] = ' ';
-  
+
   card_status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
   if (card_status != MFRC522::STATUS_OK) {
     Serial.print(F("❌ Auth failed: "));
     Serial.println(mfrc522.GetStatusCodeName(card_status));
     return false;
   }
-  
+
   card_status = mfrc522.MIFARE_Write(block, buffer, 16);
   if (card_status != MFRC522::STATUS_OK) {
     Serial.print(F("❌ Write failed: "));
     Serial.println(mfrc522.GetStatusCodeName(card_status));
     return false;
   }
-  
+
   return true;
 }
 

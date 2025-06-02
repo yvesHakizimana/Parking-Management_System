@@ -1,16 +1,15 @@
 import os
 import time
-import glob
-import serial
-import serial.tools.list_ports
 import pytesseract
 import cv2
 from ultralytics import YOLO
 import redis
 import re
 import threading
+import sys
 from collections import deque, Counter
 from datetime import datetime
+from connection.arduino_manager import ArduinoManager
 
 # Point pytesseract at the system binary on linux
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
@@ -29,130 +28,180 @@ entry_cooldown = 300
 last_saved_plate = None
 last_entry_time = 0
 
-print("[SYSTEM] ready. Press 'q' to exit.")
+print("[ENTRY SYSTEM] Starting up...")
 
-def detect_arduino_port():
-    for dev in glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"):
-        return dev
-    for port in serial.tools.list_ports.comports():
-        desc = port.description.lower()
-        if 'arduino' in desc or 'usb-serial' in desc:
-            return port.device
-    return None
+# Initialize Arduino Manager
+arduino_manager = ArduinoManager()
+arduino_manager.detect_arduino_ports()
+arduino_manager.assign_roles(['entry_exit'], {'entry_exit': '/dev/ttyACM0'})
 
-arduino_port = detect_arduino_port()
-if arduino_port:
-    print(f"[CONNECTED] Arduino on {arduino_port}")
-    arduino = serial.Serial(arduino_port, 9600, timeout=1)
-    time.sleep(2)
-else:
-    print("[ERROR] Arduino not detected.")
-    arduino = None
+# Connect to entry/exit Arduino
+if not arduino_manager.connect_arduino('entry_exit'):
+    print("[SYSTEM] Terminating program - Arduino connection required.")
+    sys.exit(1)
+
+print("[ENTRY SYSTEM] Ready. Press 'q' to exit.")
 
 def read_distance():
+    """Read distance from ultrasonic sensor"""
+    return arduino_manager.read_distance('entry_exit')
+
+def open_gate(open_duration=15):
+    """Open gate for specified duration"""
+    return arduino_manager.open_gate('entry_exit', open_duration)
+
+def is_car_inside(plate_number):
     """
-    Reads a distance (float) value from the Arduino via serial.
-    Returns the float if valid, or None if invalid/empty.
+    Check if a car is currently inside the parking lot.
+    Returns True if there's any unpaid and non-exited entry.
     """
-    if arduino and arduino.in_waiting > 0:
-        try:
-            line = arduino.readline().decode('utf-8').strip()
-            return float(line)
-        except ValueError:
-            return None
+    entry_ids = redis_client.smembers(f"entries:{plate_number}")
+    if not entry_ids:
+        return False
+
+    for entry_id in entry_ids:
+        entry_data = redis_client.hgetall(f"entry:{entry_id}")
+        # Car is inside if payment is pending OR paid but not exited
+        if (entry_data.get("payment_status") == "0" or
+                (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
+            return True
+    return False
+
+def get_active_entry_id(plate_number):
+    """
+    Get the active entry ID for a plate (unpaid or paid but not exited).
+    Returns entry_id if found, None otherwise.
+    """
+    entry_ids = redis_client.smembers(f"entries:{plate_number}")
+    if not entry_ids:
+        return None
+
+    for entry_id in entry_ids:
+        entry_data = redis_client.hgetall(f"entry:{entry_id}")
+        if (entry_data.get("payment_status") == "0" or
+                (entry_data.get("payment_status") == "1" and entry_data.get("exit_status") != "1")):
+            return entry_id
     return None
 
 # Initialize webcam
 cap = cv2.VideoCapture(0)
 
-def open_gate(arduino_conn, open_duration=15):
-    arduino_conn.write(b'1')
-    print("[GATE] Opening gate")
-    time.sleep(open_duration)
-    arduino_conn.write(b'0')
-    print("[GATE] Closing gate")
+def preprocess_plate_image(plate_img):
+    """Enhanced image preprocessing for better OCR"""
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.medianBlur(gray, 3)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    return gray
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    distance = read_distance()
-    print(f"[SENSOR] Distance: {distance}")
-
-    # 1) If we didn't get a valid distance, skip processing
-    if distance is None:
-        cv2.imshow('Webcam Feed', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
             break
-        continue
 
-    # 2) Only run the heavy YOLO + OCR pipeline if we’re close enough
-    if distance <= 50:
-        results = model(frame)
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                plate_img = frame[y1:y2, x1:x2]
+        distance = read_distance()
+        if distance is not None:
+            print(f"[SENSOR] Distance: {distance}")
 
-                gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-                blur = cv2.GaussianBlur(gray, (5, 5), 0)
-                thresh = cv2.threshold(
-                    blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-                )[1]
+        # Skip processing if no valid distance
+        if distance is None:
+            cv2.imshow('Webcam Feed', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
 
-                plate_text = pytesseract.image_to_string(
-                    thresh,
-                    config='--psm 8 --oem 3 '
-                           '-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                ).strip().replace(" ", "")
+        # Only run the heavy YOLO + OCR pipeline if we're close enough
+        if distance <= 50:
+            results = model(frame)
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    plate_img = frame[y1:y2, x1:x2]
 
-                match = plate_pattern.search(plate_text)
-                if match:
-                    plate = match.group(1)
-                    print(f"[VALID] Plate Detected: {plate}")
-                    plate_buffer.append(plate)
+                    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+                    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+                    thresh = cv2.threshold(
+                        blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )[1]
 
-                    if len(plate_buffer) == BUFFER_SIZE:
-                        most_common, _ = Counter(plate_buffer).most_common(1)[0]
-                        plate_buffer.clear()
-                        now = time.time()
+                    plate_text = pytesseract.image_to_string(
+                        thresh,
+                        config='--psm 8 --oem 3 '
+                               '-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                    ).strip().replace(" ", "")
 
-                        if (most_common != last_saved_plate or
-                           (now - last_entry_time) > entry_cooldown):
+                    match = plate_pattern.search(plate_text)
+                    if match:
+                        plate = match.group(1)
+                        print(f"[DETECTED] Plate: {plate}")
+                        plate_buffer.append(plate)
+
+                        if len(plate_buffer) == BUFFER_SIZE:
+                            most_common, _ = Counter(plate_buffer).most_common(1)[0]
+                            plate_buffer.clear()
+                            now = time.time()
+
+                            # Enhanced validation checks
+                            if is_car_inside(most_common):
+                                print(f"[ACCESS DENIED] {most_common} is already inside")
+                                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                redis_client.rpush("logs",
+                                                   f"{timestamp} - ENTRY DENIED - {most_common} - Already inside")
+                                continue
+
+                            if (most_common == last_saved_plate and
+                                    (now - last_entry_time) <= entry_cooldown):
+                                print(f"[COOLDOWN] {most_common} entry blocked due to cooldown")
+                                continue
+
+                            # Create new entry with enhanced tracking
                             entry_id = redis_client.incr("next_entry_id")
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                            redis_client.hset(f"entry:{entry_id}", mapping={
+                            # Enhanced entry data structure
+                            entry_data = {
                                 "plate_number": most_common,
-                                "payment_status": "0",
-                                "timestamp": timestamp
-                            })
-                            redis_client.sadd(f"entries:{most_common}", entry_id)
-                            redis_client.rpush("logs", f"{timestamp} - ENTRY - {most_common}")
-                            print(f"[SAVED] {most_common} logged to Redis.")
+                                "entry_timestamp": timestamp,
+                                "payment_status": "0",  # 0=unpaid, 1=paid
+                                "exit_status": "0",  # 0=inside, 1=exited
+                                "exit_timestamp": "",
+                                "charge_amount": "",
+                                "payment_timestamp": ""
+                            }
 
-                            if arduino:
-                                threading.Thread(target=open_gate, args=(arduino,)).start()
+                            redis_client.hset(f"entry:{entry_id}", mapping=entry_data)
+                            redis_client.sadd(f"entries:{most_common}", entry_id)
+                            redis_client.rpush("logs",
+                                               f"{timestamp} - ENTRY GRANTED - {most_common} - Entry ID: {entry_id}")
+                            print(f"[ENTRY GRANTED] {most_common} logged with ID: {entry_id}")
+
+                            threading.Thread(target=open_gate).start()
 
                             last_saved_plate = most_common
                             last_entry_time = now
-                        else:
-                            print(f"[SKIPPED] {most_common} skipped due to cooldown.")
 
-                cv2.imshow("Plate", plate_img)
-                cv2.imshow("Processed", thresh)
-                time.sleep(0.5)
+                    cv2.imshow("Plate", plate_img)
+                    cv2.imshow("Processed", thresh)
+                    time.sleep(0.5)
 
-        annotated_frame = results[0].plot()
-    else:
-        annotated_frame = frame
+            annotated_frame = results[0].plot()
+        else:
+            annotated_frame = frame
 
-    cv2.imshow('Webcam Feed', annotated_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        cv2.imshow('Webcam Feed', annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-cap.release()
-if arduino:
-    arduino.close()
-cv2.destroyAllWindows()
+except KeyboardInterrupt:
+    print("\n[SYSTEM] Program interrupted by user")
+except Exception as e:
+    print(f"[ERROR] Unexpected error: {e}")
+finally:
+    print("[SYSTEM] Cleaning up...")
+    cap.release()
+    arduino_manager.close_all_connections()
+    cv2.destroyAllWindows()
+    print("[SYSTEM] Program terminated")

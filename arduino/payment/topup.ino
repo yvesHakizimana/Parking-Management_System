@@ -3,7 +3,7 @@
 
 #define RST_PIN 9
 #define SS_PIN 10
-#define BALANCE_BLOCK 4
+#define BALANCE_BLOCK 6  // Changed from 5 to avoid trailer block conflicts
 #define PLATE_BLOCK 5
 #define MAX_PLATE_LENGTH 7
 #define MAX_BALANCE_DIGITS 10

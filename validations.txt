@@ -1,0 +1,26 @@
+the car if it can enter twice without coming out
+if the system can pay twice for going out
+the car can exit without going in
+Verify also if the balance can't be negative
+
+
+unauthorized exit alert subsystem
+in the gate we have
+sensor trigger connected to pin 2
+sensor echo connected to pin 3
+red led -- 4
+blue led -- 5
+servor motor -- 6
+hardcorded ground -- 7
+hardcorder ground -- 8
+buzzer - 12
+
+by default gate is closed and when the arduino is connected to the computer red led is red and the buzzer also has some noise at the startup like few seconds
+
+when the gate is opened the blue led truns blue and wait for 15 seconds to close the gate and after and like buzzer has some less noise when exiting
+
+so what I have to add is being able to handle when someone wants like to go oiut without payment it will be triggered and must be handled as
+
+well like
+
+i want to you generate the corresponding to gate and also update exit and entry accordingly
